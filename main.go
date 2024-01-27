@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -11,10 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"bytes"
 
 	"github.com/joho/godotenv"
-	openai "github.com/sashabaranov/go-openai"
-
 )
 
 type Update struct {
@@ -30,7 +28,18 @@ type Message struct {
 type Chat struct {
 	Id int `json:"id"`
 }
+type ChatMessage struct {
+    Role    string `json:"role"`
+    Content string `json:"content"`
+}
 
+type Choice struct {
+    Message ChatMessage `json:"message"`
+}
+
+type APIResponse struct {
+    Choices []Choice `json:"choices"`
+}
 // getUpdates polls Telegram server for new updates
 func getUpdates(offset int) ([]Update, error) {
 	resp, err := http.Get("https://api.telegram.org/bot" + os.Getenv("TELEGRAM_BOT_TOKEN") + "/getUpdates?offset=" + strconv.Itoa(offset))
@@ -75,16 +84,46 @@ func sendTextToTelegramChat(chatId int, text string) (string, error) {
 	log.Printf("Response from Telegram: %s", bodyString)
 	return bodyString, nil
 }
+func sendRequestToOpenAI(chatMessage string) ([]string, error) {
+    url := "http://gpt4free:1337/v1/chat/completions"
+    requestBody := map[string]interface{}{
+        "model": "gpt-3.5-turbo-16k",
+        "stream": false,
+        "messages": []ChatMessage{
+            {
+                Role: "assistant",
+                Content: chatMessage,
+            },
+        },
+    }
 
+    jsonValue, _ := json.Marshal(requestBody)
+    response, err := http.Post(url, "application/json", bytes.NewBuffer(jsonValue))
+    if err != nil {
+        log.Printf("Error when posting to OpenAI: %s", err.Error())
+        return nil, err
+    }
+    defer response.Body.Close()
+
+    var apiResponse APIResponse
+    err = json.NewDecoder(response.Body).Decode(&apiResponse)
+    if err != nil {
+        log.Printf("Error decoding JSON response: %s", err.Error())
+        return nil, err
+    }
+
+    var responses []string
+    for _, choice := range apiResponse.Choices {
+        responses = append(responses, choice.Message.Content)
+    }
+
+    return responses, nil
+}
 func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-
-	// Initialize OpenAI client
-	OpenaiToken := os.Getenv("OPEN_AI")
-	openaiClient := openai.NewClient(OpenaiToken)
 
 	var lastUpdateId int
 	chatStarted := false // Flag to check if chat with OpenAI has started
@@ -107,30 +146,26 @@ func main() {
 					log.Printf("Error sending reply: %s", err.Error())
 				}
 			} else if chatStarted {
-				// Sending received message to OpenAI
-				resp, err := openaiClient.CreateChatCompletion(
-					context.Background(),
-					openai.ChatCompletionRequest{
-						Model: openai.GPT3Dot5Turbo,
-						Messages: []openai.ChatCompletionMessage{
-							{
-								Role:    openai.ChatMessageRoleUser,
-								Content: update.Message.Text,
-							},
-						},
-					},
-				)
+
+				// Send received message to OpenAI
+				openAIResponses, err := sendRequestToOpenAI(update.Message.Text)
+				if err != nil {
+					log.Printf("Error getting response from OpenAI: %s", err.Error())
+					continue
+				}
+
 				
 				if err != nil {
 					log.Printf("ChatCompletion error: %v\n", err)
 					continue
 				}
 
-				// Sending OpenAI's response back to Telegram
-				responseMessage := resp.Choices[0].Message.Content
-				_, err = sendTextToTelegramChat(update.Message.Chat.Id, responseMessage)
-				if err != nil {
-					log.Printf("Error sending reply: %s", err.Error())
+				// Process each response (for simplicity, sending only the first response back to Telegram)
+				if len(openAIResponses) > 0 {
+					_, err = sendTextToTelegramChat(update.Message.Chat.Id, openAIResponses[0])
+					if err != nil {
+						log.Printf("Error sending reply: %s", err.Error())
+					}
 				}
 			}
 
